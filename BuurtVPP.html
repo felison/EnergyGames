@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Buurt VPP</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #fff; }
+    #root { max-width: 1100px; margin: 0 auto; }
+    input, select, button { font-family: inherit; }
+    input { box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState } = React;
+
+    const PRIJZEN = [28,22,18,16,14,14,16,22,32,58,75,88,72,65,55,60,80,120,145,130,95,68,45,32];
+    const SCENARIOS = {
+      normaal:  { label: "Normaal",                pScale: 1.0, sScale: 1.0 },
+      bewolkt:  { label: "Bewolkt (weinig zon)",   pScale: 1.2, sScale: 0.3 },
+      zonnig:   { label: "Zonnige piek + congestie", pScale: 0.8, sScale: 1.8 },
+      crisis:   { label: "Energiecrisis",          pScale: 2.5, sScale: 1.0 },
+    };
+
+    const START_KNOBS = { socMin: 15, socMax: 85, prijsHoog: 90, prijsLaag: 25, deelEerst: true, maxCycli: 1 };
+
+    function maakSpeler(naam, cap, zon) {
+      return { naam, cap: parseFloat(cap), zon: parseFloat(zon), soc: 0.45,
+        besparing: 0, arbitrage: 0, degradatie: 0, ...START_KNOBS };
+    }
+
+    function pad(n) { return String(n % 24).padStart(2, "0"); }
+    function eur(n) { return (n >= 0 ? "+" : "") + "€" + Math.abs(n).toFixed(2); }
+    function socKleur(pct) { return pct > 60 ? "#3b6d11" : pct > 30 ? "#854f0b" : "#a32d2d"; }
+
+    function analyseerUur(snapshot, pr, zonF, scLabel) {
+      const prijs = Math.round(pr);
+      const zonPct = Math.round(zonF * 100);
+      const opmerkingen = [];
+
+      const ontladers = snapshot.filter(p => p.actie === "ontladen");
+      const laders    = snapshot.filter(p => p.actie.startsWith("laden"));
+      const idlers    = snapshot.filter(p => p.actie === "idle");
+
+      if (ontladers.length === snapshot.length && prijs > 100) {
+        opmerkingen.push({ type: "goed", tekst: `Iedereen ontlaadt bij hoge prijs (€${prijs}/MWh) — uitstekende collectieve actie. Dit is precies het moment waarop de vloot zijn waarde bewijst.` });
+      }
+      if (laders.length === snapshot.length && prijs < 25) {
+        opmerkingen.push({ type: "goed", tekst: `Alle vier laden goedkoop in bij €${prijs}/MWh. Slim collectief moment — deze energie is later het dubbele waard.` });
+      }
+      if (idlers.length === snapshot.length && (prijs > 80 || prijs < 30)) {
+        opmerkingen.push({ type: "tip", tekst: `Niemand reageerde op de prijs (€${prijs}/MWh) terwijl er wel een signaal was. Controleer of de drempelwaarden niet te krap zijn ingesteld.` });
+      }
+
+      snapshot.forEach(p => {
+        const naam = p.naam;
+        const socVoorPct = Math.round(p.socVoor * 100);
+        const socNaPct   = Math.round(p.socNa * 100);
+        const nettoDelta = p.deltaB + p.deltaA - p.deltaD;
+
+        if (prijs > p.prijsHoog && p.actie === "idle" && socVoorPct <= p.socMin + 5) {
+          opmerkingen.push({ type: "waarschuwing", tekst: `${naam}: prijs €${prijs}/MWh — wil ontladen maar SoC (${socVoorPct}%) zit te dicht op het minimum van ${p.socMin}%. Overweeg socMin te verlagen of eerder op te laden.` });
+        }
+        if (prijs < p.prijsLaag && p.actie === "idle" && socVoorPct >= p.socMax - 5) {
+          opmerkingen.push({ type: "waarschuwing", tekst: `${naam}: lage prijs (€${prijs}/MWh) maar batterij al bijna vol (${socVoorPct}%). Ruimte om de socMax te verhogen of eerder te ontladen.` });
+        }
+        if (p.maxCycli >= 3 && p.deltaD > p.deltaA * 1.2 && p.deltaA > 0) {
+          opmerkingen.push({ type: "waarschuwing", tekst: `${naam}: met ${p.maxCycli}× cycli kost degradatie (€${p.deltaD.toFixed(3)}) meer dan de arbitrage opbrengt (€${p.deltaA.toFixed(3)}). Overweeg cycli terug te schroeven.` });
+        }
+        if (p.actie === "ontladen" && p.deltaA > 0.05) {
+          opmerkingen.push({ type: "goed", tekst: `${naam}: ontlaadde slim bij €${prijs}/MWh en verdiende €${p.deltaA.toFixed(3)} arbitrage dit uur.` });
+        }
+        if (p.actie === "laden (zon)" && zonPct > 40 && p.deelEerst) {
+          opmerkingen.push({ type: "goed", tekst: `${naam}: ving zonne-overschot op (${zonPct}% zon) en vermeed €${p.deltaB.toFixed(3)} terugleverkosten. Energiedelen-prioriteit werkt.` });
+        }
+        if (!p.deelEerst && zonPct > 50 && p.actie !== "laden (zon)") {
+          opmerkingen.push({ type: "tip", tekst: `${naam}: er was veel zon (${zonPct}%) maar de instelling "prijs eerst" blokkeerde het opvangen van zonne-overschot. Bij zonnige scenario's loont "delen eerst" vaak beter.` });
+        }
+        if (socNaPct <= p.socMin + 2 && p.actie === "ontladen") {
+          opmerkingen.push({ type: "tip", tekst: `${naam}: batterij raakte het minimum (${p.socMin}%) tijdens het ontladen. Voor de volgende piekuren is herladen noodzakelijk.` });
+        }
+        if (p.cap <= 5 && prijs > 100 && p.actie === "ontladen") {
+          opmerkingen.push({ type: "tip", tekst: `${naam}: kleine batterij (${p.cap} kWh) beperkt de opbrengst bij piekprijzen. In een collectief VPP compenseert de vloot dit — goede reden voor batterijpooling.` });
+        }
+        if (scLabel === "Energiecrisis" && p.actie === "idle" && prijs > 150) {
+          opmerkingen.push({ type: "waarschuwing", tekst: `${naam}: energiecrisis met €${prijs}/MWh maar geen actie. Controleer of de ontlaaddrempel (nu €${p.prijsHoog}/MWh) omhoog moet — de markt is ver voorbij de drempel.` });
+        }
+        if (p.deltaD > 0 && nettoDelta > 0 && p.deltaD / (nettoDelta + p.deltaD) > 0.6) {
+          opmerkingen.push({ type: "tip", tekst: `${naam}: degradatiekosten (€${p.deltaD.toFixed(3)}) vormen dit uur meer dan 60% van de bruto-opbrengst. Minder cycli of hogere prijsdrempels kunnen de nettomarge verbeteren.` });
+        }
+      });
+
+      const volgorde = ["waarschuwing", "tip", "goed"];
+      opmerkingen.sort((a, b) => volgorde.indexOf(a.type) - volgorde.indexOf(b.type));
+      return opmerkingen.slice(0, 4);
+    }
+
+    function BuurtVPP() {
+      const [fase, setFase] = useState("uitleg");
+      const [scenario, setScenario] = useState("normaal");
+      const [invoer, setInvoer] = useState([
+        { naam: "Karin",  cap: "10",   zon: "4" },
+        { naam: "Ahmed",  cap: "7.5",  zon: "2" },
+        { naam: "Lies",   cap: "12.5", zon: "6" },
+        { naam: "Pieter", cap: "15",   zon: "4" },
+      ]);
+      const [spelers, setSpelers] = useState([]);
+      const [uur, setUur] = useState(0);
+      const [log, setLog] = useState([]);
+
+      const sc = SCENARIOS[scenario];
+
+      function updateInvoer(i, veld, val) {
+        setInvoer(prev => prev.map((p, idx) => idx === i ? { ...p, [veld]: val } : p));
+      }
+
+      function startGame() {
+        setSpelers(invoer.map(p => maakSpeler(p.naam, p.cap, p.zon)));
+        setUur(0);
+        setLog([]);
+        setFase("game");
+      }
+
+      function updateKnob(i, veld, val) {
+        setSpelers(prev => prev.map((p, idx) => {
+          if (idx !== i) return p;
+          const v = veld === "deelEerst" ? val : parseFloat(val);
+          return { ...p, [veld]: v };
+        }));
+      }
+
+      function speelUur() {
+        if (uur >= 24) return;
+        const h = uur;
+        const pr = PRIJZEN[h] * sc.pScale;
+        const prKwh = pr / 1000;
+        const zonF = Math.max(0, Math.sin(Math.PI * (h - 6) / 12)) * sc.sScale;
+        const regels = [];
+        const snapshot = [];
+
+        setSpelers(prev => {
+          const nieuw = prev.map(p => {
+            let soc = p.soc;
+            const socVoor = soc;
+            let b = p.besparing, a = p.arbitrage, d = p.degradatie;
+            const solarProd = p.zon * zonF;
+            const cons = 0.35;
+            const selfC = Math.min(solarProd, cons);
+            const surplus = solarProd - selfC;
+            let actie = "idle";
+
+            const maxDoorvoer = (p.maxCycli * p.cap) / 24;
+            const degKosten = 0.06 + p.maxCycli * 0.02;
+            const bVoor = b, aVoor = a, dVoor = d;
+
+            if (p.deelEerst && surplus > 0 && soc * 100 < p.socMax) {
+              const ch = Math.min(surplus, maxDoorvoer, p.cap * (p.socMax / 100 - soc));
+              soc = Math.min(1, soc + ch / p.cap);
+              b += ch * 0.21; d += ch * degKosten;
+              actie = "laden (zon)";
+            }
+
+            if (pr < p.prijsLaag && soc * 100 < p.socMax) {
+              const ch = Math.min(maxDoorvoer, p.cap * (p.socMax / 100 - soc));
+              soc = Math.min(1, soc + ch / p.cap);
+              b += ch * Math.max(0, 0.27 - prKwh); d += ch * degKosten;
+              actie = "laden (prijs)";
+            } else if (pr > p.prijsHoog && soc * 100 > p.socMin) {
+              const dis = Math.min(maxDoorvoer, p.cap * (soc - p.socMin / 100));
+              soc = Math.max(0, soc - dis / p.cap);
+              a += dis * (prKwh - 0.10); d += dis * degKosten;
+              actie = "ontladen";
+            }
+
+            soc = Math.max(0, Math.min(1, soc));
+            regels.push(`${p.naam}: ${actie} → SoC ${Math.round(soc * 100)}%`);
+
+            snapshot.push({
+              naam: p.naam, cap: p.cap, zon: p.zon,
+              socVoor, socNa: soc, actie,
+              socMin: p.socMin, socMax: p.socMax,
+              prijsHoog: p.prijsHoog, prijsLaag: p.prijsLaag,
+              maxCycli: p.maxCycli, deelEerst: p.deelEerst,
+              deltaB: b - bVoor, deltaA: a - aVoor, deltaD: d - dVoor,
+            });
+
+            return { ...p, soc, besparing: b, arbitrage: a, degradatie: d };
+          });
+
+          const analyse = analyseerUur(snapshot, pr, zonF, SCENARIOS[scenario].label);
+          setLog(prev => [{ h, regels, analyse }, ...prev]);
+          return nieuw;
+        });
+
+        setUur(h + 1);
+      }
+
+      function resetGame() { setFase("uitleg"); }
+
+      if (fase === "uitleg") return (
+        <div style={{ maxWidth: "100%", padding: "1.5rem 2rem", fontFamily: "sans-serif" }}>
+          <h1 style={{ fontSize: 22, fontWeight: 500, marginBottom: "0.25rem" }}>Buurt VPP — hoe werkt het?</h1>
+          <p style={{ fontSize: 14, color: "#666", marginBottom: "1.5rem" }}>
+            Lees dit even door voor de eerste ronde. Het centrale inzicht van het spel staat hier.
+          </p>
+
+          <div style={{ background: "#f5f5f5", borderRadius: 10, padding: "1rem 1.25rem", marginBottom: "1.25rem" }}>
+            <p style={{ fontSize: 14, fontWeight: 500, marginBottom: "0.5rem" }}>De kern: één batterij, twee strategieën — maar nooit tegelijk</p>
+            <p style={{ fontSize: 13, color: "#444", lineHeight: 1.7, margin: 0 }}>
+              Met een thuisbatterij kun je twee dingen verdienen: <strong>energie delen</strong> (zonnestroom van de buren opslaan
+              en terugleverkosten vermijden) en <strong>prijsarbitrage</strong> (goedkoop laden als stroom weinig kost,
+              duur verkopen als de prijs piekt). Maar elke kWh kun je maar één keer gebruiken.
+              Laden voor de een is niet laden voor de ander — je moet dus kiezen <em>wanneer</em> je welke strategie volgt.
+              Dat heet het <strong>stacked value model</strong>: de waarden stapel je niet gelijktijdig, maar temporeel.
+            </p>
+          </div>
+
+          <p style={{ fontSize: 13, fontWeight: 500, marginBottom: "0.5rem" }}>De slimme dagindeling — op een normale dag</p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 6, marginBottom: "1.25rem" }}>
+            {[
+              { tijd: "00–06", label: "Laden", sub: "Prijs laag → goedkoop inladen voor de avondpiek", kleur: "#e6f1fb", rand: "#185fa5", tekst: "#0c447c" },
+              { tijd: "06–10", label: "Wachten", sub: "Bewaar ruimte voor de zon die eraan komt", kleur: "#f5f5f5", rand: "#bbb", tekst: "#555" },
+              { tijd: "10–15", label: "Zonne-energie", sub: "Overschot van buren opvangen → terugleverkosten vermijden", kleur: "#faeeda", rand: "#ba7517", tekst: "#633806" },
+              { tijd: "15–17", label: "Wachten", sub: "SoC vasthouden voor de avondpiek", kleur: "#f5f5f5", rand: "#bbb", tekst: "#555" },
+              { tijd: "17–21", label: "Ontladen", sub: "Prijs hoog → arbitrage-inkomsten maximaliseren", kleur: "#eaf3de", rand: "#3b6d11", tekst: "#27500a" },
+              { tijd: "21–00", label: "Rust", sub: "SoC stabiel houden, batterij beschermen", kleur: "#fcebeb", rand: "#a32d2d", tekst: "#791f1f" },
+            ].map((b, i) => (
+              <div key={i} style={{ background: b.kleur, border: `1px solid ${b.rand}`, borderRadius: 8, padding: "0.6rem 0.75rem" }}>
+                <div style={{ fontSize: 11, color: b.tekst, fontWeight: 500, marginBottom: 3 }}>{b.tijd}</div>
+                <div style={{ fontSize: 13, fontWeight: 500, color: b.tekst, marginBottom: 4 }}>{b.label}</div>
+                <div style={{ fontSize: 11, color: b.tekst, lineHeight: 1.5, opacity: 0.85 }}>{b.sub}</div>
+              </div>
+            ))}
+          </div>
+
+          <p style={{ fontSize: 13, fontWeight: 500, marginBottom: "0.5rem" }}>De drie spanningen die je in het spel voelt</p>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: "1.25rem" }}>
+            {[
+              { titel: "Timing conflict", inhoud: "Zon schijnt overdag. Lage prijzen zijn 's nachts. Je kunt niet op beide momenten laden — kies je tijdvenster.", kleur: "#e6f1fb", rand: "#185fa5", tekstKleur: "#0c447c" },
+              { titel: "SoC conflict", inhoud: "Vol laden voor arbitrage? Dan geen ruimte voor zonne-energie. Leeg bewaren voor zon? Dan mis je de avondpiek.", kleur: "#faeeda", rand: "#ba7517", tekstKleur: "#633806" },
+              { titel: "Cycli conflict", inhoud: "Meer cycli = meer kansen, maar ook meer slijtage. De degradatiekosten kunnen de arbitrageopbrengst overtreffen.", kleur: "#fcebeb", rand: "#a32d2d", tekstKleur: "#791f1f" },
+            ].map((k, i) => (
+              <div key={i} style={{ background: k.kleur, border: `1px solid ${k.rand}`, borderRadius: 8, padding: "0.75rem 1rem" }}>
+                <div style={{ fontSize: 13, fontWeight: 500, color: k.tekstKleur, marginBottom: 6 }}>{k.titel}</div>
+                <div style={{ fontSize: 12, color: k.tekstKleur, lineHeight: 1.6, opacity: 0.9 }}>{k.inhoud}</div>
+              </div>
+            ))}
+          </div>
+
+          <p style={{ fontSize: 13, fontWeight: 500, marginBottom: "0.5rem" }}>Wat de knoppen betekenen</p>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: "1.5rem" }}>
+            {[
+              ["SoC minimum", "De veiligheidsgrens. Onder dit niveau ontlaadt de batterij nooit — ook niet bij hoge prijzen. Beschermt de levensduur."],
+              ["SoC maximum", "De bovengrens voor laden. Hoger = meer buffer voor arbitrage, maar minder ruimte voor zonne-opvang."],
+              ["Ontlaad boven €X/MWh", "Pas als de prijs boven deze drempel zit, verkoopt de batterij stroom terug. Te laag = te vroeg ontladen, te hoog = kans gemist."],
+              ["Laad onder €X/MWh", "Alleen laden als de prijs onder deze drempel zit. Bepaalt je inkoopmoment voor arbitrage."],
+              ["Max cycli per dag", "Hoe actief de batterij mag zijn. Meer cycli = meer kansen, maar hogere slijtagekosten per kWh."],
+              ["Delen eerst / Prijs eerst", "Prioriteit: vang je eerst zonne-overschot op (Laag 2), of wacht je altijd op het beste prijsmoment (Laag 3)?"],
+            ].map(([k, v], i) => (
+              <div key={i} style={{ display: "flex", gap: 8, padding: "0.5rem 0.75rem", background: "#f9f9f9", borderRadius: 6, border: "1px solid #eee" }}>
+                <div style={{ fontSize: 12, fontWeight: 500, minWidth: 140, color: "#333" }}>{k}</div>
+                <div style={{ fontSize: 12, color: "#666", lineHeight: 1.5 }}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          <button onClick={() => setFase("setup")}
+            style={{ width: "100%", padding: "0.75rem", fontSize: 15, fontWeight: 500, background: "#111", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer" }}>
+            Begrepen — ga naar spelersregistratie →
+          </button>
+        </div>
+      );
+
+      if (fase === "setup") return (
+        <div style={{ maxWidth: "100%", padding: "1rem 1.5rem", fontFamily: "sans-serif" }}>
+          <h1 style={{ fontSize: 22, fontWeight: 500, marginBottom: "0.25rem" }}>Buurt VPP — buurtavond</h1>
+          <p style={{ fontSize: 14, color: "#666", marginBottom: "1.5rem" }}>
+            Vul de vier spelers in, kies een scenario en start het spel.
+          </p>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: "1rem" }}>
+            {invoer.map((p, i) => (
+              <div key={i} style={{ border: "1px solid #ddd", borderRadius: 10, padding: "1rem" }}>
+                <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>Speler {i + 1}</p>
+                <label style={{ fontSize: 12, color: "#666", display: "block", marginBottom: 4 }}>Naam</label>
+                <input value={p.naam} onChange={e => updateInvoer(i, "naam", e.target.value)}
+                  style={{ width: "100%", marginBottom: 8, padding: "6px 8px", border: "1px solid #ddd", borderRadius: 6, fontSize: 13 }} />
+                <label style={{ fontSize: 12, color: "#666", display: "block", marginBottom: 4 }}>Batterij (kWh)</label>
+                <select value={p.cap} onChange={e => updateInvoer(i, "cap", e.target.value)}
+                  style={{ width: "100%", marginBottom: 8, padding: "6px 8px", border: "1px solid #ddd", borderRadius: 6, fontSize: 13 }}>
+                  {["5","7.5","10","12.5","15"].map(v => <option key={v} value={v}>{v} kWh</option>)}
+                </select>
+                <label style={{ fontSize: 12, color: "#666", display: "block", marginBottom: 4 }}>Zonnepanelen (kWp)</label>
+                <select value={p.zon} onChange={e => updateInvoer(i, "zon", e.target.value)}
+                  style={{ width: "100%", padding: "6px 8px", border: "1px solid #ddd", borderRadius: 6, fontSize: 13 }}>
+                  {["0","2","4","6","8"].map(v => <option key={v} value={v}>{v} kWp</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginBottom: "1rem" }}>
+            <label style={{ fontSize: 13, color: "#666", display: "block", marginBottom: 4 }}>Scenario</label>
+            <select value={scenario} onChange={e => setScenario(e.target.value)}
+              style={{ width: "100%", padding: "8px 10px", border: "1px solid #ddd", borderRadius: 6, fontSize: 14 }}>
+              {Object.entries(SCENARIOS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+            </select>
+          </div>
+
+          <button onClick={startGame}
+            style={{ width: "100%", padding: "0.7rem", fontSize: 15, fontWeight: 500, background: "#111", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer" }}>
+            Spel starten
+          </button>
+        </div>
+      );
+
+      const totB = spelers.reduce((s, p) => s + p.besparing, 0);
+      const totA = spelers.reduce((s, p) => s + p.arbitrage, 0);
+      const totD = spelers.reduce((s, p) => s + p.degradatie, 0);
+      const totN = totB + totA - totD;
+      const huidigePrijs = uur < 24 ? Math.round(PRIJZEN[uur] * sc.pScale) : null;
+      const huidigZon = uur < 24 ? Math.round(Math.max(0, Math.sin(Math.PI * (uur - 6) / 12)) * sc.sScale * 100) : null;
+
+      return (
+        <div style={{ maxWidth: "100%", padding: "1rem 1.5rem", fontFamily: "sans-serif" }}>
+          <div style={{ background: "#f5f5f5", borderRadius: 8, padding: "0.6rem 1rem", marginBottom: "1rem", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <span style={{ fontSize: 14, fontWeight: 500 }}>
+                {uur < 24 ? `Uur ${uur + 1} van 24` : "Dag afgerond"}
+              </span>
+              <span style={{ fontSize: 12, color: "#666", marginLeft: 8 }}>
+                {pad(uur)}:00 – {pad(uur + 1)}:00
+              </span>
+            </div>
+            {uur < 24 && (
+              <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+                <span style={{ fontSize: 13 }}>
+                  Prijs: <strong style={{ color: huidigePrijs > 90 ? "#a32d2d" : huidigePrijs < 30 ? "#3b6d11" : "#854f0b" }}>
+                    €{huidigePrijs}/MWh
+                  </strong>
+                </span>
+                <span style={{ fontSize: 13 }}>Zon: <strong>{huidigZon}%</strong></span>
+              </div>
+            )}
+            <button onClick={speelUur} disabled={uur >= 24}
+              style={{ padding: "0.4rem 1.2rem", fontSize: 13, fontWeight: 500, background: uur >= 24 ? "#ccc" : "#111", color: "#fff", border: "none", borderRadius: 6, cursor: uur >= 24 ? "default" : "pointer" }}>
+              {uur >= 24 ? "Dag klaar" : "▶ Speel dit uur"}
+            </button>
+            <button onClick={() => setFase("uitleg")}
+              style={{ padding: "0.4rem 0.75rem", fontSize: 13, background: "transparent", color: "#666", border: "1px solid #ddd", borderRadius: 6, cursor: "pointer" }}
+              title="Terug naar uitleg">
+              ? Uitleg
+            </button>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: "1rem" }}>
+            {spelers.map((p, i) => {
+              const socPct = Math.round(p.soc * 100);
+              const kl = socKleur(socPct);
+              const netto = p.besparing + p.arbitrage - p.degradatie;
+              return (
+                <div key={i} style={{ border: "1px solid #ddd", borderRadius: 10, padding: "0.75rem" }}>
+                  <p style={{ fontSize: 13, fontWeight: 500, marginBottom: 8 }}>{p.naam}</p>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                    <span style={{ fontSize: 12, color: kl, minWidth: 32 }}>{socPct}%</span>
+                    <div style={{ flex: 1, height: 8, background: "#eee", borderRadius: 4, overflow: "hidden" }}>
+                      <div style={{ width: socPct + "%", height: "100%", background: kl, borderRadius: 4, transition: "width 0.4s" }} />
+                    </div>
+                    <span style={{ fontSize: 12, color: "#888" }}>{(p.soc * p.cap).toFixed(1)}kWh</span>
+                  </div>
+
+                  <div style={{ borderTop: "1px solid #eee", paddingTop: 8 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
+                      <div>
+                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 3 }}>SoC min</label>
+                        <select value={p.socMin} onChange={e => updateKnob(i, "socMin", e.target.value)}
+                          style={{ width: "100%", fontSize: 12, padding: "4px 6px", border: "1px solid #ddd", borderRadius: 4 }}>
+                          {[5,10,15,20,25,30].map(v => <option key={v} value={v}>{v}%</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 3 }}>SoC max</label>
+                        <select value={p.socMax} onChange={e => updateKnob(i, "socMax", e.target.value)}
+                          style={{ width: "100%", fontSize: 12, padding: "4px 6px", border: "1px solid #ddd", borderRadius: 4 }}>
+                          {[60,70,80,85,90,95,100].map(v => <option key={v} value={v}>{v}%</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 6 }}>
+                      <div>
+                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 3 }}>Ontlaad boven</label>
+                        <select value={p.prijsHoog} onChange={e => updateKnob(i, "prijsHoog", e.target.value)}
+                          style={{ width: "100%", fontSize: 12, padding: "4px 6px", border: "1px solid #ddd", borderRadius: 4 }}>
+                          {[40,60,80,90,100,120,150,180].map(v => <option key={v} value={v}>€{v}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 3 }}>Laad onder</label>
+                        <select value={p.prijsLaag} onChange={e => updateKnob(i, "prijsLaag", e.target.value)}
+                          style={{ width: "100%", fontSize: 12, padding: "4px 6px", border: "1px solid #ddd", borderRadius: 4 }}>
+                          {[10,15,20,25,30,40,50].map(v => <option key={v} value={v}>€{v}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    <div style={{ marginBottom: 6 }}>
+                      <label style={{ fontSize: 11, color: "#888", display: "block", marginBottom: 3 }}>
+                        Max cycli/dag — meer = meer arbitrage, meer slijtage
+                      </label>
+                      <select value={p.maxCycli} onChange={e => updateKnob(i, "maxCycli", e.target.value)}
+                        style={{ width: "100%", fontSize: 12, padding: "4px 6px", border: "1px solid #ddd", borderRadius: 4 }}>
+                        {[
+                          [1,   "1× — voorzichtig (min. slijtage)"],
+                          [1.5, "1.5× — gematigd"],
+                          [2,   "2× — actief"],
+                          [3,   "3× — agressief"],
+                          [4,   "4× — maximaal (hoge slijtage)"],
+                        ].map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                      </select>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button onClick={() => updateKnob(i, "deelEerst", true)}
+                        style={{ flex: 1, fontSize: 11, padding: "4px 0", borderRadius: 4, cursor: "pointer", border: "1px solid #ddd", background: p.deelEerst ? "#111" : "#fff", color: p.deelEerst ? "#fff" : "#666" }}>
+                        Delen eerst
+                      </button>
+                      <button onClick={() => updateKnob(i, "deelEerst", false)}
+                        style={{ flex: 1, fontSize: 11, padding: "4px 0", borderRadius: 4, cursor: "pointer", border: "1px solid #ddd", background: !p.deelEerst ? "#111" : "#fff", color: !p.deelEerst ? "#fff" : "#666" }}>
+                        Prijs eerst
+                      </button>
+                    </div>
+                  </div>
+
+                  <div style={{ borderTop: "1px solid #eee", marginTop: 8, paddingTop: 8 }}>
+                    <div style={{ fontSize: 11, color: "#888", marginBottom: 4 }}>Resultaten tot nu toe</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                      {[
+                        ["Besparing",  p.besparing,  false],
+                        ["Arbitrage",  p.arbitrage,  false],
+                        ["Degradatie", p.degradatie, true ],
+                        ["Netto",      netto,         false],
+                      ].map(([label, val, negatief]) => (
+                        <div key={label} style={{ background: label === "Netto" ? (netto >= 0 ? "#eaf3de" : "#fcebeb") : "#f5f5f5", borderRadius: 4, padding: "4px 6px" }}>
+                          <div style={{ fontSize: 10, color: "#999" }}>{label}</div>
+                          <div style={{ fontSize: 13, fontWeight: label === "Netto" ? 500 : 400, color: negatief ? "#a32d2d" : val >= 0 ? "#3b6d11" : "#a32d2d" }}>
+                            {negatief ? "–€" + val.toFixed(2) : eur(val)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: "1rem", marginBottom: "1rem" }}>
+            <p style={{ fontSize: 13, fontWeight: 500, marginBottom: "0.75rem" }}>Collectief resultaat</p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: "0.75rem" }}>
+              {[
+                ["Besparing", totB, false],
+                ["Arbitrage", totA, false],
+                ["Degradatie", totD, true],
+                ["Netto", totN, false],
+              ].map(([label, val, negOnly]) => (
+                <div key={label} style={{ background: "#f5f5f5", borderRadius: 6, padding: "8px", textAlign: "center" }}>
+                  <div style={{ fontSize: 11, color: "#888", marginBottom: 3 }}>{label}</div>
+                  <div style={{ fontSize: 15, fontWeight: 500, color: negOnly ? "#a32d2d" : val >= 0 ? "#3b6d11" : "#a32d2d" }}>
+                    {negOnly ? "–€" + val.toFixed(2) : eur(val)}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ maxHeight: 240, overflowY: "auto", fontSize: 12, color: "#666" }}>
+              {log.map((entry, idx) => (
+                <div key={idx} style={{ marginBottom: 10, paddingBottom: 10, borderBottom: idx < log.length - 1 ? "1px solid #eee" : "none" }}>
+                  <div style={{ fontWeight: 500, color: "#333", marginBottom: 4 }}>
+                    Uur {pad(entry.h)}:00 – prijs €{Math.round(PRIJZEN[entry.h] * sc.pScale)}/MWh
+                  </div>
+                  <div style={{ marginBottom: 6 }}>
+                    {entry.regels.map((r, j) => <div key={j}>{r}</div>)}
+                  </div>
+                  {entry.analyse && entry.analyse.length > 0 && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {entry.analyse.map((obs, k) => {
+                        const stijl = {
+                          goed:        { bg: "#eaf3de", kleur: "#3b6d11", label: "✓" },
+                          tip:         { bg: "#faeeda", kleur: "#854f0b", label: "→" },
+                          waarschuwing:{ bg: "#fcebeb", kleur: "#a32d2d", label: "!" },
+                        }[obs.type];
+                        return (
+                          <div key={k} style={{ background: stijl.bg, borderRadius: 4, padding: "4px 8px", fontSize: 11, color: stijl.kleur, display: "flex", gap: 6, alignItems: "flex-start" }}>
+                            <span style={{ fontWeight: 700, flexShrink: 0 }}>{stijl.label}</span>
+                            <span>{obs.tekst}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ))}
+              {log.length === 0 && <span>Nog geen uren gespeeld.</span>}
+            </div>
+          </div>
+
+          <button onClick={resetGame}
+            style={{ fontSize: 12, color: "#888", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+            ↩ Opnieuw beginnen
+          </button>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<BuurtVPP />);
+  </script>
+</body>
+</html>
